@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from functools import partial
 import logging
+import time
 from typing import Any, override
 
 from propcache.api import cached_property
@@ -16,7 +17,7 @@ from homeassistant.const import (
     ATTR_VIA_DEVICE,
     EntityCategory,
 )
-from homeassistant.core import State, callback
+from homeassistant.core import Context, State, callback
 from homeassistant.helpers.device_registry import CONNECTION_ZIGBEE, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
@@ -34,6 +35,13 @@ from .helpers import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# A user context captured on a command stays eligible to be re-applied to the
+# confirming device report for this long. It must exceed core's
+# CONTEXT_RECENT_TIME_SECONDS (5s) so slow-reporting Zigbee devices keep user
+# attribution, while staying short enough that an unrelated later device report
+# is not mis-attributed to the user.
+COMMAND_CONTEXT_EXPIRY_SECONDS = 30
+
 
 class ZHAEntity(LogMixin, RestoreEntity, Entity):
     """ZHA eitity."""
@@ -47,6 +55,8 @@ class ZHAEntity(LogMixin, RestoreEntity, Entity):
         super().__init__(*args, **kwargs)
         self.entity_data: EntityData = entity_data
         self._unsubs: list[Callable[[], None]] = []
+        self._command_context: Context | None = None
+        self._command_context_expiry: float | None = None
 
         if self.entity_data.entity.icon is not None:
             # Only custom quirks will realistically set an icon
@@ -145,10 +155,62 @@ class ZHAEntity(LogMixin, RestoreEntity, Entity):
         return device_info
 
     @callback
+    @override
+    def async_set_context(self, context: Context) -> None:
+        """Set the context and remember it for the confirming device report.
+
+        ZHA is push-based (should_poll=False) and non-optimistic entities only
+        reflect their new state once the device confirms it over the air, which
+        can take longer than CONTEXT_RECENT_TIME_SECONDS. By then core has
+        cleared the entity context, dropping user attribution in the logbook.
+        Snapshot the context so the confirming event can re-apply it.
+        """
+        super().async_set_context(context)
+        self._command_context = context
+        self._command_context_expiry = time.time() + COMMAND_CONTEXT_EXPIRY_SECONDS
+
+    @callback
+    def _forget_command_context(self) -> None:
+        """Drop the captured command context and the applied entity context.
+
+        Clearing the entity context too (mirroring core's own expiry in
+        Entity._async_write_ha_state) ensures a device-initiated change right
+        after the confirmed transition is not attributed to the user.
+        """
+        self._command_context = None
+        self._command_context_expiry = None
+        self._context = None
+        self._context_set = None
+
+    @callback
     def _handle_entity_events(self, event: Any) -> None:
         """Entity state changed."""
         self.debug("Handling event from entity: %s", event)
+
+        if self._command_context is None:
+            self.async_write_ha_state()
+            return
+
+        if time.time() > (self._command_context_expiry or 0):
+            self._forget_command_context()
+            self.async_write_ha_state()
+            return
+
+        old_state = self.hass.states.get(self.entity_id)
+        # Base implementation, not self.async_set_context, to avoid re-arming
+        # the capture and refreshing the expiry on every intermediate event.
+        Entity.async_set_context(self, self._command_context)
         self.async_write_ha_state()
+        new_state = self.hass.states.get(self.entity_id)
+
+        if (
+            old_state is not None
+            and new_state is not None
+            and old_state.state != new_state.state
+        ):
+            # The commanded transition has been attributed; stop watching so a
+            # later genuinely device-initiated change is not mis-attributed.
+            self._forget_command_context()
 
     @override
     async def async_added_to_hass(self) -> None:
