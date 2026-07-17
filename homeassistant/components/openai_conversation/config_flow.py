@@ -9,6 +9,7 @@ import openai
 import voluptuous as vol
 from voluptuous_openapi import convert
 
+from homeassistant import data_entry_flow
 from homeassistant.components.zone import ENTITY_ID_HOME
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
@@ -261,6 +262,7 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
             return self.async_abort(reason="entry_not_loaded")
 
         options = self.options
+        errors: dict[str, str] = {}
 
         hass_apis: list[SelectOptionDict] = [
             SelectOptionDict(
@@ -307,6 +309,41 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
             vol.Required(CONF_RECOMMENDED, default=options.get(CONF_RECOMMENDED, False))
         ] = bool
 
+        # Advanced options, hidden (and skipped) while "recommended" is enabled.
+        hide_when_recommended: data_entry_flow.FieldCondition = {
+            "field": CONF_RECOMMENDED,
+            "value": True,
+        }
+        step_schema.update(
+            {
+                data_entry_flow.Optional(
+                    CONF_CHAT_MODEL,
+                    default=RECOMMENDED_CHAT_MODEL,
+                    hidden=hide_when_recommended,
+                ): str,
+                data_entry_flow.Optional(
+                    CONF_MAX_TOKENS,
+                    default=RECOMMENDED_MAX_TOKENS,
+                    hidden=hide_when_recommended,
+                ): int,
+                data_entry_flow.Optional(
+                    CONF_TOP_P,
+                    default=RECOMMENDED_TOP_P,
+                    hidden=hide_when_recommended,
+                ): NumberSelector(NumberSelectorConfig(min=0, max=1, step=0.05)),
+                data_entry_flow.Optional(
+                    CONF_TEMPERATURE,
+                    default=RECOMMENDED_TEMPERATURE,
+                    hidden=hide_when_recommended,
+                ): NumberSelector(NumberSelectorConfig(min=0, max=2, step=0.05)),
+                data_entry_flow.Optional(
+                    CONF_STORE_RESPONSES,
+                    default=RECOMMENDED_STORE_RESPONSES,
+                    hidden=hide_when_recommended,
+                ): bool,
+            }
+        )
+
         if user_input is not None:
             if not user_input.get(CONF_LLM_HASS_API):
                 user_input.pop(CONF_LLM_HASS_API, None)
@@ -323,58 +360,17 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                     data=user_input,
                 )
 
-            options.update(user_input)
-            if CONF_LLM_HASS_API in options and CONF_LLM_HASS_API not in user_input:
-                options.pop(CONF_LLM_HASS_API)
-            return await self.async_step_advanced()
-
-        return self.async_show_form(
-            step_id="init",
-            data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
-            ),
-        )
-
-    async def async_step_advanced(
-        self, user_input: dict[str, Any] | None = None
-    ) -> SubentryFlowResult:
-        """Manage advanced options."""
-        options = self.options
-        errors: dict[str, str] = {}
-
-        step_schema: VolDictType = {
-            vol.Optional(
-                CONF_CHAT_MODEL,
-                default=RECOMMENDED_CHAT_MODEL,
-            ): str,
-            vol.Optional(
-                CONF_MAX_TOKENS,
-                default=RECOMMENDED_MAX_TOKENS,
-            ): int,
-            vol.Optional(
-                CONF_TOP_P,
-                default=RECOMMENDED_TOP_P,
-            ): NumberSelector(NumberSelectorConfig(min=0, max=1, step=0.05)),
-            vol.Optional(
-                CONF_TEMPERATURE,
-                default=RECOMMENDED_TEMPERATURE,
-            ): NumberSelector(NumberSelectorConfig(min=0, max=2, step=0.05)),
-            vol.Optional(
-                CONF_STORE_RESPONSES,
-                default=RECOMMENDED_STORE_RESPONSES,
-            ): bool,
-        }
-
-        if user_input is not None:
-            options.update(user_input)
             if user_input.get(CONF_CHAT_MODEL) in UNSUPPORTED_MODELS:
                 errors[CONF_CHAT_MODEL] = "model_not_supported"
 
             if not errors:
+                options.update(user_input)
+                if CONF_LLM_HASS_API in options and CONF_LLM_HASS_API not in user_input:
+                    options.pop(CONF_LLM_HASS_API)
                 return await self.async_step_model()
 
         return self.async_show_form(
-            step_id="advanced",
+            step_id="init",
             data_schema=self.add_suggested_values_to_schema(
                 vol.Schema(step_schema), options
             ),
